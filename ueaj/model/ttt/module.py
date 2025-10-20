@@ -9,6 +9,8 @@ from ueaj.model import GMLP
 from ueaj.model.einsum import Einsum, lecun_normal_init, zeros_init
 from ueaj.utils.configurator import config
 from .impl import ttt
+from .impl_implicit import implicit_ttt
+from .impl_hybrid import hybrid_ttt
 
 
 @config
@@ -36,7 +38,7 @@ class TTTModel(nnx.Module):
 		module: Callable = GMLP,
 		module_kwargs: dict | None = None,
 		param_dtype: jnp.dtype = jnp.bfloat16,
-		surrogate: bool = True,
+		surrogate: bool | str = True,
 		*,
 		rngs: rng.Rngs,
 		mesh: Optional[jax.sharding.Mesh] = None
@@ -52,6 +54,16 @@ class TTTModel(nnx.Module):
 		self.model_d = model_d
 		self.hidden_d = hidden_d
 		self.surrogate = surrogate
+
+		# Determine method from surrogate parameter
+		if isinstance(surrogate, str):
+			self.method = surrogate
+		elif surrogate is True:
+			self.method = 'surrogate'
+		elif surrogate is False:
+			self.method = 'bptt'
+		else:
+			raise ValueError(f"Invalid surrogate value: {surrogate}")
 
 		# Create fused k, v, q projection
 		size_dict = {'d': model_d, 'h': hidden_d, 'i': 3}
@@ -86,8 +98,18 @@ class TTTModel(nnx.Module):
 			sharding=('tensor', None) if mesh is not None else None
 		)
 
-		# Create the TTT forward function
-		self.ttt_fn = ttt(self._fwd_fn, surrogate=surrogate)
+		# Create the TTT forward function based on method
+		if self.method == 'surrogate':
+			self.ttt_fn = ttt(self._fwd_fn, surrogate=True)
+		elif self.method == 'bptt':
+			self.ttt_fn = ttt(self._fwd_fn, surrogate=False)
+		elif self.method == 'implicit':
+			self.ttt_fn = implicit_ttt(self._fwd_fn)
+		elif self.method == 'hybrid':
+			self.ttt_fn = hybrid_ttt(self._fwd_fn)
+		else:
+			raise ValueError(f"Unknown method: {self.method}")
+
 		self.inner_module_gdef = nnx.graphdef(self.inner_module)
 
 	def _fwd_fn(self, module_state: nnx.State, x: jax.Array) -> jax.Array:
