@@ -71,7 +71,8 @@ def ttt(fwd_fn, surrogate=True):
 
 		dstate = jax.tree.map(jnp.zeros_like, state)
 
-		(end_state, dstate), (o_seq, dq_seq) = jax.lax.scan(q_scan, (state, dstate), (k_seq, v_seq, q_seq, do_seq))
+		# Store all intermediate states and dstates for Fix 2
+		(end_state, dstate_final), (o_seq, dq_seq) = jax.lax.scan(q_scan, (state, dstate), (k_seq, v_seq, q_seq, do_seq))
 
 		def kv_scan(carry, x):
 			k_state, v_state = carry
@@ -80,8 +81,25 @@ def ttt(fwd_fn, surrogate=True):
 			new_v_state, dv = v_scan(v_state, (q, do, k))
 			# new_k_state, dk = k_scan(k_state, ((q, o+do), dq, (k, v+dv)))
 			# ORIGINAL (FAILS): new_k_state, dk = k_scan(k_state, (q, q+dq, k))
-			# FIX 1: Make dk symmetric with dv - use do as reconstruction target
-			new_k_state, dk = k_scan(k_state, (q, do, k))
+			# FIX 1 (FAILED ~5% improvement): new_k_state, dk = k_scan(k_state, (q, do, k))
+			# FIX 2: Use dstate to chain gradients through state update
+			# Compute how k affects state update, then multiply by dstate_final
+			def state_update_via_k(k_input):
+				"""Compute state update caused by k_input."""
+				# Reconstruction loss gradient
+				v_pred, vjp_fn = jax.vjp(lambda s: fwd_fn(s, k_input), k_state)
+				dv_local = v - v_pred
+				dstate_local, = vjp_fn(dv_local)
+				# Return how state changes (simplified - ignores optimizer details)
+				return dstate_local
+
+			# Compute dstate/dk using JVP
+			_, vjp_dstate_wrt_k = jax.vjp(state_update_via_k, k)
+
+			# Chain with dstate_final: dk = (dL/dstate) × (dstate/dk)
+			dk, = vjp_dstate_wrt_k(dstate_final)
+
+			new_k_state = k_state
 
 			return (new_k_state, new_v_state), (dk, dv)
 
