@@ -8,12 +8,14 @@ Available gradient methods:
 - bptt: Full BPTT (ground truth, expensive)
 - implicit: Implicit differentiation (avoids BPTT)
 - hybrid: Hybrid chunking (BPTT within blocks)
+- forward: Forward-mode with truncated history
 """
 
 from .module import TTTModel
 from .impl import ttt, make_scan_fn, make_reverse_fn
 from .impl_implicit import implicit_ttt
 from .impl_hybrid import hybrid_ttt
+from .impl_forward import forward_ttt
 from .test_framework import TTTGradientTester
 
 __all__ = [
@@ -23,5 +25,6 @@ __all__ = [
 	'make_reverse_fn',
 	'implicit_ttt',
 	'hybrid_ttt',
+	'forward_ttt',
 	'TTTGradientTester',
 ]

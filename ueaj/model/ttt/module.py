@@ -11,6 +11,7 @@ from ueaj.utils.configurator import config
 from .impl import ttt
 from .impl_implicit import implicit_ttt
 from .impl_hybrid import hybrid_ttt
+from .impl_forward import forward_ttt
 
 
 @config
@@ -107,6 +108,8 @@ class TTTModel(nnx.Module):
 			self.ttt_fn = implicit_ttt(self._fwd_fn)
 		elif self.method == 'hybrid':
 			self.ttt_fn = hybrid_ttt(self._fwd_fn)
+		elif self.method == 'forward':
+			self.ttt_fn = forward_ttt(self._fwd_fn)
 		else:
 			raise ValueError(f"Unknown method: {self.method}")
 
