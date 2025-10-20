@@ -103,12 +103,14 @@ def ttt(fwd_fn, surrogate=True):
 
 			return (new_k_state, new_v_state), (dk, dv)
 
-		# todo no special case
+		# FIX 3: Remove state hacking - use end_state directly
+		# Original code zeros out down_proj for unclear reasons (likely hack to prevent gradient explosion)
+		# Testing without this to see if Fix 2 makes it unnecessary
 		k_state = jax.tree.map(lambda x: x, end_state)
-		k_state.down_proj = jax.tree.map(jnp.zeros_like, k_state.down_proj)
+		# k_state.down_proj = jax.tree.map(jnp.zeros_like, k_state.down_proj)  # REMOVED in Fix 3
 
 		v_state = jax.tree.map(lambda x: x, end_state)
-		v_state.down_proj = jax.tree.map(jnp.zeros_like, v_state.down_proj)
+		# v_state.down_proj = jax.tree.map(jnp.zeros_like, v_state.down_proj)  # REMOVED in Fix 3
 
 		(_, _), (dk_seq, dv_seq) = jax.lax.scan(kv_scan, (k_state, v_state), (k_seq, v_seq, q_seq, o_seq, do_seq, dq_seq), reverse=True)
 
