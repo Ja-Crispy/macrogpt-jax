@@ -79,7 +79,9 @@ def ttt(fwd_fn, surrogate=True):
 
 			new_v_state, dv = v_scan(v_state, (q, do, k))
 			# new_k_state, dk = k_scan(k_state, ((q, o+do), dq, (k, v+dv)))
-			new_k_state, dk = k_scan(k_state, (q, q+dq, k))
+			# ORIGINAL (FAILS): new_k_state, dk = k_scan(k_state, (q, q+dq, k))
+			# FIX 1: Make dk symmetric with dv - use do as reconstruction target
+			new_k_state, dk = k_scan(k_state, (q, do, k))
 
 			return (new_k_state, new_v_state), (dk, dv)
 

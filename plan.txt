@@ -1,0 +1,699 @@
+# TTT Gradient Fix Implementation Plan
+
+## Overview
+Fix the BPTT gradient computation issue in Test-Time Training (TTT) implementation. Current status: dq works perfectly, dv works adequately, dk completely fails (cosine similarity oscillates around 0).
+
+## Current Testing Methodology
+- Compare `surrogate=True` vs `surrogate=False` (ground truth BPTT)
+- Seq length: 200 tokens, hidden_d: 512, batch_size: 1
+- Metrics: cosine similarity (dk, dv), RMS error (dq), per-token analysis
+- Testing via notebook: `ueaj/model/ttt/ttt_gradient_analysis.ipynb`
+
+## Phase 1: Debug Current Surrogate (Priority)
+
+### Root Cause Analysis
+**Problem location**: `ueaj/model/ttt/impl.py:82`
+```python
+# Line 80: dv computation (works)
+new_v_state, dv = v_scan(v_state, (q, do, k))
+
+# Line 82: dk computation (FAILS)
+new_k_state, dk = k_scan(k_state, (q, q+dq, k))
+```
+
+**Issue**: Asymmetric treatment of dk vs dv. The `q+dq` target disconnects k from actual gradient flow through state updates.
+
+### Three Sequential Fix Attempts
+
+**Fix 1: Symmetric Treatment**
+- Change line 82 to: `new_k_state, dk = k_scan(k_state, (q, do, k))`
+- Rationale: Make dk use same pattern as dv (output gradient as target)
+- Test: Run notebook, check dk cosine_sim
+
+**Fix 2: State Gradient Propagation**
+- Use accumulated `dstate` from q_scan (line 74) to compute dk
+- Properly chain: ∂L/∂k = ∂L/∂state × ∂state/∂k through reconstruction VJP
+- More principled gradient flow
+
+**Fix 3: Remove State Hacking**
+- Remove lines 87-91 (`jax.tree.map(jnp.zeros_like, k_state.down_proj)`)
+- Use `end_state` directly without zeroing down_proj
+- Test if hacks are masking the real problem
+
+### Testing Protocol
+After each fix:
+1. Run notebook with modified `impl.py`
+2. Check dk cosine_sim > 0.5, consistently positive
+3. Verify search direction validity (d·g > 0)
+4. Document why fix works/fails
+
+**Success Criteria**: dk cosine_sim > 0.5, stable across sequence
+
+---
+
+## Phase 2: Implement Alternative Methods (Parallel)
+
+Start only after understanding WHY surrogate fails (even if unfixed).
+
+### File Structure
+```
+ueaj/model/ttt/
+├── impl.py                # Original + debugged version
+├── impl_implicit.py       # Method 1: Implicit differentiation
+├── impl_forward.py        # Method 2: Forward-mode truncation
+├── impl_hybrid.py         # Method 3: Hybrid chunking
+├── test_framework.py      # Unified testing infrastructure
+└── ttt_gradient_analysis.ipynb  # Existing notebook
+```
+
+### Method 1: Implicit Differentiation (`impl_implicit.py`)
+
+**Theory**: Avoid BPTT via implicit function theorem at equilibrium.
+
+**Key Components**:
+1. **Equilibrium Finding**: State θ* where ∇_θ L_inner(θ*, k, v) = 0
+2. **Implicit Gradient**: dk = -[∂²L/∂θ²]^(-1) [∂²L/∂θ∂k]
+3. **Linear Solve**: Use `jax.scipy.sparse.linalg.cg` for Hessian inverse
+
+**Implementation Details**:
+```python
+def implicit_ttt_gradient(fwd_fn, state, k, v, q,
+                         max_cg_iters=10, cg_tol=1e-5):
+    # Inner loss for state update
+    def inner_loss(state, k, v):
+        pred = fwd_fn(state, k)
+        return jnp.mean((pred - v) ** 2)
+
+    # Find equilibrium via gradient descent
+    for _ in range(5):  # inner optimization steps
+        grad = jax.grad(inner_loss, argnums=0)(state, k, v)
+        state = jax.tree_map(lambda s, g: s - 0.01 * g, state, grad)
+
+    # Compute output
+    output = fwd_fn(state, q)
+
+    # Implicit differentiation for gradients
+    def hvp(v_vec):
+        """Hessian-vector product: ∂²L/∂θ² @ v"""
+        _, hvp_fn = jax.vjp(
+            lambda s: jax.grad(inner_loss, argnums=0)(s, k, v),
+            state
+        )
+        return hvp_fn(v_vec)[0]
+
+    # Compute mixed partial: ∂²L/∂θ∂k (CORRECTLY)
+    def compute_mixed_partial():
+        def grad_wrt_state(k_val):
+            return jax.grad(inner_loss, argnums=0)(state, k_val, v)
+        _, jvp_fn = jax.jvp(grad_wrt_state, (k,), (jnp.ones_like(k),))
+        return jvp_fn
+
+    # Solve: [∂²L/∂θ²] × dθ/dk = -∂²L/∂θ∂k using CG
+    # Return dk via chain rule
+```
+
+**Key Fix from plan.txt**: Correctly compute mixed partial using JVP, not scalar dot product.
+
+**Advantages**:
+- Mathematically rigorous
+- No BPTT needed
+- Well-tested JAX CG solver
+
+**Challenges**:
+- Requires equilibrium assumption
+- CG convergence may be slow
+- Memory: O(d²) for Hessian-vector products
+
+### Method 2: Forward-Mode with Truncation (`impl_forward.py`)
+
+**Theory**: Propagate gradient estimates forward using JVP, maintain truncated history.
+
+**Key Difference from plan.txt**: No random projections - proper truncated dependency tracking.
+
+**Implementation Details**:
+```python
+def forward_mode_ttt(fwd_fn, history_len=32):
+    """
+    Forward-mode AD with truncated history.
+    Memory: O(K × d²) where K = history_len
+    """
+
+    def init_grad_history():
+        """Initialize gradient history buffer (circular)"""
+        return {
+            'buffer': [],  # List of gradient states
+            'ptr': 0,      # Current position
+            'size': history_len
+        }
+
+    def forward_step_with_grad(state, grad_history, x, target):
+        """Single step with gradient accumulation"""
+        # Standard forward
+        output = fwd_fn(state, x)
+
+        # Update state via SGD on reconstruction
+        loss = jnp.mean((output - target) ** 2)
+        grad_state = jax.grad(lambda s: loss)(state)
+        new_state = apply_update(state, grad_state)
+
+        # Forward-mode: propagate gradients through state update
+        # Use truncated history (last K steps only)
+        truncated_grads = get_recent_grads(grad_history, history_len)
+
+        # JVP to propagate each historical gradient
+        new_grad_history = []
+        for i, hist_grad in enumerate(truncated_grads):
+            # How does this update affect historical gradient?
+            _, tangent_out = jax.jvp(
+                lambda s: apply_update(s, grad_state),
+                (state,),
+                (hist_grad,)
+            )
+            new_grad_history.append(tangent_out)
+
+        # Add current gradient
+        new_grad_history.append(grad_state)
+
+        # Update circular buffer
+        grad_history = update_buffer(grad_history, new_grad_history)
+
+        return new_state, grad_history, output
+
+    # Scan over sequence with gradient tracking
+    def ttt_forward_mode(k, v, q, init_state):
+        grad_history = init_grad_history()
+
+        def scan_fn(carry, x):
+            state, grad_hist = carry
+            k_t, v_t, q_t = x
+
+            # Update with k, v
+            new_state, new_grad_hist, _ = forward_step_with_grad(
+                state, grad_hist, k_t, v_t
+            )
+
+            # Query with q
+            output = fwd_fn(new_state, q_t)
+
+            return (new_state, new_grad_hist), output
+
+        _, outputs = jax.lax.scan(scan_fn, (init_state, grad_history), (k, v, q))
+        return outputs
+```
+
+**Advantages**:
+- Principled gradient approximation
+- Controllable memory (adjust history_len)
+- No equilibrium assumption
+
+**Challenges**:
+- Approximation quality depends on history_len
+- Gradient flow truncated beyond K steps
+- More complex implementation
+
+### Method 3: Hybrid Chunking (`impl_hybrid.py`)
+
+**Theory**: Divide sequence into blocks. Full BPTT within blocks, surrogate/implicit between blocks.
+
+**Implementation Details**:
+```python
+def hybrid_ttt_layer(fwd_fn, block_size=64, inter_block_method='implicit'):
+    """
+    Hybrid architecture: local BPTT + surrogate between blocks.
+
+    Args:
+        fwd_fn: Inner module forward function
+        block_size: Tokens per block (full BPTT within)
+        inter_block_method: 'implicit', 'surrogate', or 'none'
+    """
+
+    def process_sequence(k, v, q, init_state):
+        batch, seq_len, dim = k.shape
+        n_blocks = seq_len // block_size
+
+        outputs = []
+        state = init_state
+
+        for block_idx in range(n_blocks):
+            # Extract block
+            start_idx = block_idx * block_size
+            end_idx = start_idx + block_size
+            k_block = k[:, start_idx:end_idx]
+            v_block = v[:, start_idx:end_idx]
+            q_block = q[:, start_idx:end_idx]
+
+            # Process block with FULL BPTT (tractable for small blocks)
+            block_output, new_state = process_block_with_bptt(
+                state, k_block, v_block, q_block, fwd_fn
+            )
+
+            outputs.append(block_output)
+
+            # Inter-block transition (no BPTT needed)
+            if block_idx < n_blocks - 1:
+                if inter_block_method == 'implicit':
+                    state = implicit_state_update(state, k_block, v_block)
+                elif inter_block_method == 'surrogate':
+                    state = surrogate_state_update(state, k_block, v_block)
+                else:  # 'none'
+                    state = new_state  # Just carry forward
+
+        return jnp.concatenate(outputs, axis=1)
+
+    def process_block_with_bptt(state, k_block, v_block, q_block, fwd_fn):
+        """Standard TTT with full BPTT for one block"""
+        # Use make_scan_fn from impl.py - it's just small sequence
+        scan_fn = make_scan_fn(fwd_fn)
+
+        k_seq = k_block.swapaxes(0, 1)
+        v_seq = v_block.swapaxes(0, 1)
+        q_seq = q_block.swapaxes(0, 1)
+
+        new_state, outputs = jax.lax.scan(
+            scan_fn,
+            state,
+            (k_seq, v_seq, q_seq)
+        )
+
+        return outputs.swapaxes(0, 1), new_state
+```
+
+**Advantages**:
+- Guaranteed to work (BPTT within blocks is proven)
+- Controllable memory (adjust block_size)
+- Can combine with other methods (implicit/surrogate between blocks)
+
+**Challenges**:
+- Not novel (engineering solution)
+- Block boundaries may be artifacts
+- Gradient flow limited to block_size
+
+---
+
+## Phase 3: Unified Testing Framework
+
+### Extract Notebook Logic into `test_framework.py`
+
+**Core Testing Class**:
+```python
+class TTTGradientTester:
+    """Unified testing for all TTT implementations."""
+
+    def __init__(self, seq_len=500, hidden_d=512, batch_size=4, model_d=128):
+        self.seq_len = seq_len
+        self.hidden_d = hidden_d
+        self.batch_size = batch_size
+        self.model_d = model_d
+
+    def generate_synthetic_data(self, seed=42):
+        """Generate random k, v, q matching ueaj's setup."""
+        key = jax.random.PRNGKey(seed)
+        k_key, v_key, q_key = jax.random.split(key, 3)
+
+        k = jax.random.normal(k_key, (self.batch_size, self.seq_len, self.hidden_d))
+        v = jax.random.normal(v_key, (self.batch_size, self.seq_len, self.hidden_d))
+        q = jax.random.normal(q_key, (self.batch_size, self.seq_len, self.hidden_d))
+
+        return k, v, q
+
+    def compute_true_bptt_grads(self, k, v, q, model):
+        """Compute ground truth gradients using full BPTT (surrogate=False)."""
+        grad_output = jax.random.normal(
+            jax.random.PRNGKey(456),
+            (self.batch_size, self.seq_len, self.hidden_d)
+        )
+
+        def forward(k, v, q):
+            return model.apply_ttt(k, v, q)
+
+        output, vjp_fn = jax.vjp(forward, k, v, q)
+        grad_k, grad_v, grad_q = vjp_fn(grad_output)
+
+        return grad_k, grad_v, grad_q, grad_output
+
+    def compute_method_grads(self, k, v, q, model, grad_output):
+        """Compute gradients using method model (e.g., surrogate=True)."""
+        def forward(k, v, q):
+            return model.apply_ttt(k, v, q)
+
+        output, vjp_fn = jax.vjp(forward, k, v, q)
+        grad_k, grad_v, grad_q = vjp_fn(grad_output)
+
+        return grad_k, grad_v, grad_q
+
+    def cosine_similarity_per_token(self, grad_true, grad_method):
+        """Compute cosine similarity per token position (average over batch)."""
+        dot_product = jnp.sum(grad_true * grad_method, axis=2)  # (batch, seq)
+        norm_true = jnp.linalg.norm(grad_true, axis=2)
+        norm_method = jnp.linalg.norm(grad_method, axis=2)
+        cosine_sim = dot_product / (norm_true * norm_method + 1e-8)
+        return cosine_sim.mean(axis=0)  # (seq,)
+
+    def rms_error_per_token(self, grad_true, grad_method):
+        """RMS error per token position."""
+        diff = grad_true - grad_method
+        rms_per_batch = jnp.sqrt(jnp.mean(diff**2, axis=2))
+        return rms_per_batch.mean(axis=0)
+
+    def check_descent_direction(self, grad_true, grad_method):
+        """Check if method gradient is valid descent direction (d·g > 0)."""
+        dot_product = jnp.sum(grad_true * grad_method)
+        return dot_product > 0
+
+    def test_method(self, method_model, true_model, name="method"):
+        """
+        Full test of a single method.
+
+        Returns:
+            dict with metrics and per-token analyses
+        """
+        # Generate data
+        k, v, q = self.generate_synthetic_data()
+
+        # True gradients
+        true_dk, true_dv, true_dq, grad_output = self.compute_true_bptt_grads(
+            k, v, q, true_model
+        )
+
+        # Method gradients
+        method_dk, method_dv, method_dq = self.compute_method_grads(
+            k, v, q, method_model, grad_output
+        )
+
+        # Compute metrics
+        metrics = {
+            'dk_cosine_sim': self.cosine_similarity_per_token(true_dk, method_dk),
+            'dv_cosine_sim': self.cosine_similarity_per_token(true_dv, method_dv),
+            'dq_cosine_sim': self.cosine_similarity_per_token(true_dq, method_dq),
+
+            'dk_rms': self.rms_error_per_token(true_dk, method_dk),
+            'dv_rms': self.rms_error_per_token(true_dv, method_dv),
+            'dq_rms': self.rms_error_per_token(true_dq, method_dq),
+
+            'dk_descent': self.check_descent_direction(true_dk, method_dk),
+            'dv_descent': self.check_descent_direction(true_dv, method_dv),
+            'dq_descent': self.check_descent_direction(true_dq, method_dq),
+        }
+
+        # Summary statistics
+        summary = {
+            'name': name,
+            'dk_cosine_mean': float(metrics['dk_cosine_sim'].mean()),
+            'dk_cosine_min': float(metrics['dk_cosine_sim'].min()),
+            'dk_cosine_max': float(metrics['dk_cosine_sim'].max()),
+
+            'dv_cosine_mean': float(metrics['dv_cosine_sim'].mean()),
+            'dq_rms_mean': float(metrics['dq_rms'].mean()),
+
+            'all_descent_valid': (
+                metrics['dk_descent'] and
+                metrics['dv_descent'] and
+                metrics['dq_descent']
+            ),
+        }
+
+        return metrics, summary
+
+    def compare_methods(self, methods_dict, save_dir='./ttt_results'):
+        """
+        Compare multiple methods, generate comprehensive analysis.
+
+        Args:
+            methods_dict: {'method_name': (method_model, true_model), ...}
+            save_dir: Directory to save results
+        """
+        os.makedirs(save_dir, exist_ok=True)
+
+        all_results = {}
+        all_summaries = []
+
+        # Test each method
+        for name, (method_model, true_model) in methods_dict.items():
+            print(f"Testing {name}...")
+            metrics, summary = self.test_method(method_model, true_model, name)
+            all_results[name] = metrics
+            all_summaries.append(summary)
+
+        # Generate comparison plots
+        self.plot_comparison(all_results, save_dir)
+
+        # Save summary table
+        self.save_summary_table(all_summaries, save_dir)
+
+        return all_results, all_summaries
+
+    def plot_comparison(self, all_results, save_dir):
+        """Generate comparison plots for all methods."""
+        import matplotlib.pyplot as plt
+
+        n_methods = len(all_results)
+        fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+        fig.suptitle('TTT Gradient Methods Comparison', fontsize=14, fontweight='bold')
+
+        tokens = np.arange(self.seq_len)
+
+        # Plot dk cosine similarity
+        for name, metrics in all_results.items():
+            axes[0].plot(tokens, metrics['dk_cosine_sim'], label=name, linewidth=2, alpha=0.8)
+        axes[0].axhline(y=0, color='r', linestyle='--', linewidth=2, label='Random', alpha=0.5)
+        axes[0].set_xlabel('Token Position')
+        axes[0].set_ylabel('Cosine Similarity')
+        axes[0].set_title('Gradient dk')
+        axes[0].legend()
+        axes[0].grid(True, alpha=0.3)
+
+        # Plot dv cosine similarity
+        for name, metrics in all_results.items():
+            axes[1].plot(tokens, metrics['dv_cosine_sim'], label=name, linewidth=2, alpha=0.8)
+        axes[1].axhline(y=0, color='r', linestyle='--', linewidth=2, label='Random', alpha=0.5)
+        axes[1].set_xlabel('Token Position')
+        axes[1].set_ylabel('Cosine Similarity')
+        axes[1].set_title('Gradient dv')
+        axes[1].legend()
+        axes[1].grid(True, alpha=0.3)
+
+        # Plot dq RMS error
+        for name, metrics in all_results.items():
+            axes[2].plot(tokens, metrics['dq_rms'], label=name, linewidth=2, alpha=0.8)
+        axes[2].set_xlabel('Token Position')
+        axes[2].set_ylabel('RMS Error')
+        axes[2].set_title('Gradient dq')
+        axes[2].legend()
+        axes[2].grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plt.savefig(f'{save_dir}/comparison.png', dpi=150, bbox_inches='tight')
+        plt.close()
+
+    def save_summary_table(self, summaries, save_dir):
+        """Save summary statistics as CSV and text."""
+        import pandas as pd
+
+        df = pd.DataFrame(summaries)
+        df.to_csv(f'{save_dir}/summary.csv', index=False)
+
+        # Also save human-readable text
+        with open(f'{save_dir}/summary.txt', 'w') as f:
+            f.write("TTT Gradient Methods Summary\n")
+            f.write("="*60 + "\n\n")
+            for summary in summaries:
+                f.write(f"Method: {summary['name']}\n")
+                f.write(f"  dk cosine sim: {summary['dk_cosine_mean']:.4f} "
+                       f"[{summary['dk_cosine_min']:.4f}, {summary['dk_cosine_max']:.4f}]\n")
+                f.write(f"  dv cosine sim: {summary['dv_cosine_mean']:.4f}\n")
+                f.write(f"  dq RMS error:  {summary['dq_rms_mean']:.6f}\n")
+                f.write(f"  Valid descent: {summary['all_descent_valid']}\n")
+                f.write("\n")
+```
+
+**Usage Example**:
+```python
+# Create tester
+tester = TTTGradientTester(seq_len=500, hidden_d=512, batch_size=4)
+
+# Create models for each method
+methods = {
+    'Surrogate (Original)': (model_surrogate_orig, model_bptt),
+    'Surrogate (Fixed)': (model_surrogate_fixed, model_bptt),
+    'Implicit Diff': (model_implicit, model_bptt),
+    'Forward Mode': (model_forward, model_bptt),
+    'Hybrid': (model_hybrid, model_bptt),
+}
+
+# Run comparison
+results, summaries = tester.compare_methods(methods, save_dir='./ttt_comparison')
+```
+
+---
+
+## Phase 4: Scaling & Language Modeling
+
+**Proceed only if**: At least ONE method achieves dk cosine_sim > 0.5 and valid descent direction.
+
+### Scaling Tests
+
+**Test Sequence Lengths**: [128, 256, 512, 1024, 2048]
+
+**Metrics to Track**:
+1. **Gradient Quality Degradation**:
+   - Does dk cosine_sim decrease with sequence length?
+   - At what length does method break down?
+
+2. **Memory Usage**:
+   - Peak memory consumption vs sequence length
+   - Use `tracemalloc` or JAX memory profiler
+
+3. **Compute Time**:
+   - Forward pass time
+   - Backward pass time
+   - Total time per token
+
+4. **Numerical Stability**:
+   - Check for NaNs/Infs at longer sequences
+   - Gradient norm growth
+
+**Implementation**:
+```python
+def scaling_test(method_model, seq_lengths=[128, 256, 512, 1024, 2048]):
+    results = []
+
+    for seq_len in seq_lengths:
+        # Create tester with current seq_len
+        tester = TTTGradientTester(seq_len=seq_len)
+
+        # Test gradient quality
+        metrics, summary = tester.test_method(method_model, true_model)
+
+        # Measure memory
+        memory_peak = measure_peak_memory(method_model, seq_len)
+
+        # Measure time
+        time_fwd, time_bwd = measure_timing(method_model, seq_len)
+
+        results.append({
+            'seq_len': seq_len,
+            'dk_cosine_mean': summary['dk_cosine_mean'],
+            'memory_mb': memory_peak / 1024**2,
+            'time_fwd_ms': time_fwd * 1000,
+            'time_bwd_ms': time_bwd * 1000,
+        })
+
+    return results
+```
+
+### Language Modeling Tests
+
+**Dataset**: WikiText-103 (subset for testing)
+
+**Setup**:
+```python
+from datasets import load_dataset
+from transformers import AutoTokenizer
+
+# Load data
+dataset = load_dataset('wikitext', 'wikitext-103-raw-v1', split='test[:1000]')
+
+# Tokenize
+tokenizer = AutoTokenizer.from_pretrained('gpt2')
+tokenized = dataset.map(
+    lambda x: tokenizer(x['text'], truncation=True, max_length=512),
+    batched=True
+)
+```
+
+**Metrics**:
+1. **Perplexity**: Standard language modeling metric
+2. **Throughput**: Tokens/second
+3. **Training Stability**: Loss curve over steps
+
+**Comparison**:
+- TTT with different gradient methods
+- Standard transformer baseline (same size)
+- Standard RNN (GRU/LSTM) baseline
+
+**Implementation**:
+```python
+def language_modeling_test(model, tokenized_data, n_steps=1000):
+    """Test on real language modeling task."""
+
+    losses = []
+    perplexities = []
+
+    for step in range(n_steps):
+        # Get batch
+        batch = get_batch(tokenized_data, batch_size=4, seq_len=512)
+
+        # Forward pass
+        logits = model(batch['input_ids'])
+
+        # Compute loss
+        loss = cross_entropy_loss(logits, batch['labels'])
+        perplexity = jnp.exp(loss)
+
+        losses.append(float(loss))
+        perplexities.append(float(perplexity))
+
+        # Backward pass + update
+        grads = jax.grad(loss_fn)(model_params)
+        model_params = optimizer.update(grads, model_params)
+
+        if step % 100 == 0:
+            print(f"Step {step}: loss={loss:.4f}, ppl={perplexity:.2f}")
+
+    return {
+        'final_loss': losses[-1],
+        'final_perplexity': perplexities[-1],
+        'loss_curve': losses,
+        'perplexity_curve': perplexities,
+    }
+```
+
+---
+
+## Success Criteria
+
+### Minimum Viable Success
+- At least ONE method achieves:
+  - dk cosine_sim > 0.5 (mean across sequence)
+  - Valid descent direction (d·g > 0)
+  - Stable on 500 token sequences
+  - No NaNs or numerical issues
+
+### Strong Success
+- One method achieves:
+  - dk cosine_sim > 0.95 (matching dq quality)
+  - Scales to 2048 tokens without degradation
+  - Memory usage ≤ O(√n) or better
+  - Competitive perplexity on WikiText-103
+
+### Publication-Worthy Success
+- Novel theoretical insight into surrogate failure mode
+- New method that is:
+  - Theoretically motivated (not just heuristic)
+  - Empirically validated on real tasks
+  - Generalizable beyond TTT
+- Comprehensive empirical comparison
+- Open-source implementation + reproducible results
+
+---
+
+## Order of Progression
+
+1. **Debug Surrogate**: Try 3 fixes on `impl.py`, document findings
+2. **Test Framework**: Extract notebook into reusable `test_framework.py`
+3. **Implicit Diff**: Implement and test (most promising method)
+4. **Forward Mode + Hybrid**: Implement in parallel (if implicit insufficient)
+5. **Method Comparison**: Run unified tests, generate plots/tables
+6. **Scaling Tests**: Vary sequence lengths, measure degradation
+7. **Language Modeling**: Test on WikiText-103, compare to baselines
+8. **Documentation**: Write up findings (blog post / paper draft)
+
+---
+
+## Notes
+
+- All implementations should be production-quality: thorough, no obvious holes
+- Test after each major change
+- Document why things work/fail - understanding is as important as fixing
+- If all methods fail, that's also a valid result (document WHY)
+- Prioritize learning and rigorous experimentation over quick fixes
