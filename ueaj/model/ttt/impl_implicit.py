@@ -177,11 +177,13 @@ def implicit_ttt(fwd_fn, n_iters=5, lr=0.01, wd=0.1, cg_max_iters=10, cg_tol=1e-
             dstate_from_output, = vjp_output(do_t)
 
             # Combine: dk comes from both direct effect and through state
-            dk_t = jax.tree.map(
-                lambda ds_k, ds_o: jnp.sum(ds_k * ds_o),
-                dstate_wrt_k,
-                dstate_from_output
-            )
+            # Flatten pytrees to compute scalar gradient magnitude
+            flat_k, _ = jax.flatten_util.ravel_pytree(dstate_wrt_k)
+            flat_o, _ = jax.flatten_util.ravel_pytree(dstate_from_output)
+            dk_magnitude = jnp.dot(flat_k, flat_o)
+
+            # Return gradient with same shape as k_t (broadcast scalar)
+            dk_t = dk_magnitude * jnp.ones_like(k_t)
 
             # Similarly for dv (simpler - direct reconstruction target)
             def loss_wrt_v(v_val):

@@ -275,10 +275,12 @@ def forward_ttt_simple(fwd_fn, history_len=16, n_iters=1, wd=0.1, lr=0.01):
             )
 
             # Chain with output gradient (simplified)
-            dk_t = jax.tree.map(
-                lambda jvp_grad: jvp_grad * jnp.mean(do_seq[t]),
-                jvp_result
-            )
+            # Flatten pytree to scalar and broadcast to k_t shape
+            flat_jvp, _ = jax.flatten_util.ravel_pytree(jvp_result)
+            dk_magnitude = jnp.mean(flat_jvp) * jnp.mean(do_seq[t])
+
+            # Return gradient with same shape as k_t
+            dk_t = dk_magnitude * jnp.ones_like(k_t)
 
             return dk_t
 
