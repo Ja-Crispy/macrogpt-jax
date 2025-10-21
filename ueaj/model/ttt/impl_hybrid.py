@@ -223,7 +223,7 @@ def hybrid_ttt_custom_vjp(fwd_fn, block_size=64, n_iters=1, wd=0.1, lr=0.01):
         return _hybrid_fwd(k, v, q, state)[0]
 
     def _hybrid_bwd(res, do):
-        """Backward pass: BPTT within each block."""
+        """Backward pass: BPTT within each block with state gradient propagation."""
         k, v, q, block_states, block_size, init_state = res
 
         batch, seq_len, dim = k.shape
@@ -234,8 +234,11 @@ def hybrid_ttt_custom_vjp(fwd_fn, block_size=64, n_iters=1, wd=0.1, lr=0.01):
         dv_list = []
         dq_list = []
 
-        # Process blocks in reverse
+        # Process blocks in reverse with state gradient accumulation
         blocks_to_process = n_full_blocks + (1 if remainder > 0 else 0)
+
+        # Initialize state gradient accumulator (starts at zero for last block)
+        dstate_accum = jax.tree.map(jnp.zeros_like, block_states[0])
 
         for block_idx in reversed(range(blocks_to_process)):
             if block_idx < n_full_blocks:
@@ -253,15 +256,27 @@ def hybrid_ttt_custom_vjp(fwd_fn, block_size=64, n_iters=1, wd=0.1, lr=0.01):
 
             block_state = block_states[block_idx]
 
-            # Compute gradients for this block using VJP
-            def block_forward(k_b, v_b, q_b):
+            # Compute gradients for this block using VJP (including state)
+            def block_forward(state_input, k_b, v_b, q_b):
+                """Forward for this block with state as input."""
                 out, _ = process_block_with_bptt(
-                    block_state, k_b, v_b, q_b, block_scan
+                    state_input, k_b, v_b, q_b, block_scan
                 )
                 return out
 
-            _, vjp_fn = jax.vjp(block_forward, k_block, v_block, q_block)
-            dk_block, dv_block, dq_block = vjp_fn(do_block)
+            # VJP w.r.t. both state and inputs
+            _, vjp_fn = jax.vjp(block_forward, block_state, k_block, v_block, q_block)
+            dstate_block, dk_block, dv_block, dq_block = vjp_fn(do_block)
+
+            # Accumulate state gradients from future blocks
+            dstate_total = jax.tree.map(
+                lambda ds_block, ds_accum: ds_block + ds_accum,
+                dstate_block,
+                dstate_accum
+            )
+
+            # Use accumulated state gradient as input for previous block
+            dstate_accum = dstate_total
 
             dk_list.insert(0, dk_block)
             dv_list.insert(0, dv_block)
@@ -272,8 +287,8 @@ def hybrid_ttt_custom_vjp(fwd_fn, block_size=64, n_iters=1, wd=0.1, lr=0.01):
         dv = jnp.concatenate(dv_list, axis=1)
         dq = jnp.concatenate(dq_list, axis=1)
 
-        # Gradient w.r.t. initial state (simplified: zero)
-        dstate = jax.tree.map(jnp.zeros_like, init_state)
+        # Gradient w.r.t. initial state (from first block)
+        dstate = dstate_accum
 
         return dk, dv, dq, dstate
 

@@ -279,8 +279,8 @@ def forward_ttt_simple(fwd_fn, history_len=16, n_iters=1, wd=0.1, lr=0.01):
             flat_jvp, _ = jax.flatten_util.ravel_pytree(jvp_result)
             dk_magnitude = jnp.mean(flat_jvp) * jnp.mean(do_seq[t])
 
-            # Return gradient with same shape as k_t
-            dk_t = dk_magnitude * jnp.ones_like(k_t)
+            # Return gradient with same shape as k_t (explicit array creation)
+            dk_t = jnp.full_like(k_t, dk_magnitude)
 
             return dk_t
 

@@ -182,8 +182,8 @@ def implicit_ttt(fwd_fn, n_iters=5, lr=0.01, wd=0.1, cg_max_iters=10, cg_tol=1e-
             flat_o, _ = jax.flatten_util.ravel_pytree(dstate_from_output)
             dk_magnitude = jnp.dot(flat_k, flat_o)
 
-            # Return gradient with same shape as k_t (broadcast scalar)
-            dk_t = dk_magnitude * jnp.ones_like(k_t)
+            # Return gradient with same shape as k_t (explicit array creation)
+            dk_t = jnp.full_like(k_t, dk_magnitude)
 
             # Similarly for dv (simpler - direct reconstruction target)
             def loss_wrt_v(v_val):
