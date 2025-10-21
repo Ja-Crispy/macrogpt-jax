@@ -33,8 +33,8 @@ def make_block_scan_fn(fwd_fn, distance=True, n_iters=1, wd=0.1, lr=0.01):
     """
     def update_fn(state, x):
         k, v, q = x
-        o = fwd_fn(state, q)
 
+        # Inner optimization: update state based on k, v
         for _ in range(n_iters):
             v_pred, dstate_fn = jax.vjp(lambda state: fwd_fn(state, k), state)
             dv = (v - v_pred) if distance else v
@@ -45,6 +45,9 @@ def make_block_scan_fn(fwd_fn, distance=True, n_iters=1, wd=0.1, lr=0.01):
                 lambda a, b: (1 - wd * lr) * a + lr * jax.nn.tanh(b),
                 state, dstate
             )
+
+        # Compute output AFTER state update
+        o = fwd_fn(state, q)
 
         return state, o
 

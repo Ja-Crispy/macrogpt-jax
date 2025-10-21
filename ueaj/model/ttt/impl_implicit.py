@@ -199,9 +199,18 @@ def implicit_ttt(fwd_fn, n_iters=5, lr=0.01, wd=0.1, cg_max_iters=10, cg_tol=1e-
 
             return dk_t, dv_t, dq_t
 
-        # Compute gradients for all timesteps
-        # For now, using vmap (could optimize further)
-        dk_seq, dv_seq, dq_seq = jax.vmap(compute_grads_at_timestep)(jnp.arange(seq_len))
+        # Compute gradients for all timesteps sequentially (avoid OOM from parallel CG solves)
+        def scan_grads(carry, t):
+            """Process one timestep: compute gradients via implicit diff + CG."""
+            dk_t, dv_t, dq_t = compute_grads_at_timestep(t)
+            return carry, (dk_t, dv_t, dq_t)
+
+        # Sequential scan over timesteps (200 CG solves but one at a time)
+        _, (dk_seq, dv_seq, dq_seq) = jax.lax.scan(
+            scan_grads,
+            None,  # No carry needed
+            jnp.arange(seq_len)
+        )
 
         # Swap back to (batch, seq, dim)
         dk = dk_seq.swapaxes(0, 1)

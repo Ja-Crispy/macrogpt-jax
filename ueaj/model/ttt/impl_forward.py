@@ -282,9 +282,12 @@ def forward_ttt_simple(fwd_fn, history_len=16, n_iters=1, wd=0.1, lr=0.01):
 
             return dk_t
 
-        # Compute dk for all timesteps (simplified: no full history tracking)
-        # Use vmap for efficiency
-        dk_seq = jax.vmap(compute_dk_for_timestep)(jnp.arange(seq_len))
+        # Compute dk for all timesteps sequentially (avoid memory issues)
+        def scan_dk(carry, t):
+            dk_t = compute_dk_for_timestep(t)
+            return carry, dk_t
+
+        _, dk_seq = jax.lax.scan(scan_dk, None, jnp.arange(seq_len))
 
         # Standard VJP for dv and dq (placeholder - zero for now)
         dv_seq = jnp.zeros_like(v_seq)

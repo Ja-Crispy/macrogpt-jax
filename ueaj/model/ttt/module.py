@@ -9,9 +9,9 @@ from ueaj.model import GMLP
 from ueaj.model.einsum import Einsum, lecun_normal_init, zeros_init
 from ueaj.utils.configurator import config
 from .impl import ttt
-from .impl_implicit import implicit_ttt
+from .impl_implicit import implicit_ttt, implicit_ttt_simple
 from .impl_hybrid import hybrid_ttt
-from .impl_forward import forward_ttt
+from .impl_forward import forward_ttt, forward_ttt_simple
 
 
 @config
@@ -105,11 +105,13 @@ class TTTModel(nnx.Module):
 		elif self.method == 'bptt':
 			self.ttt_fn = ttt(self._fwd_fn, surrogate=False)
 		elif self.method == 'implicit':
+			# Full implicit diff with per-timestep CG (scan for memory efficiency)
 			self.ttt_fn = implicit_ttt(self._fwd_fn)
 		elif self.method == 'hybrid':
 			self.ttt_fn = hybrid_ttt(self._fwd_fn)
 		elif self.method == 'forward':
-			self.ttt_fn = forward_ttt(self._fwd_fn)
+			# Use simple version to avoid tracing issues with circular buffer
+			self.ttt_fn = forward_ttt_simple(self._fwd_fn)
 		else:
 			raise ValueError(f"Unknown method: {self.method}")
 
