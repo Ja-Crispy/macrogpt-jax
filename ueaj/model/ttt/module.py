@@ -12,6 +12,9 @@ from .impl import ttt
 from .impl_implicit import implicit_ttt, implicit_ttt_simple
 from .impl_hybrid import hybrid_ttt, hybrid_ttt_custom_vjp
 from .impl_forward import forward_ttt, forward_ttt_simple
+from .impl_feedback import feedback_alignment_ttt, direct_feedback_alignment_ttt
+from .impl_forward_forward import forward_forward_ttt, goodness_ttt
+from .impl_perturbation import perturbation_ttt, simultaneous_perturbation_ttt
 
 
 @config
@@ -113,6 +116,24 @@ class TTTModel(nnx.Module):
 		elif self.method == 'forward':
 			# Use simple version to avoid tracing issues with circular buffer
 			self.ttt_fn = forward_ttt_simple(self._fwd_fn)
+		elif self.method == 'feedback':
+			# Feedback alignment: fixed random feedback matrices
+			self.ttt_fn = feedback_alignment_ttt(self._fwd_fn, hidden_d=hidden_d)
+		elif self.method == 'dfa':
+			# Direct feedback alignment: single feedback matrix for all
+			self.ttt_fn = direct_feedback_alignment_ttt(self._fwd_fn, hidden_d=hidden_d)
+		elif self.method == 'forward_forward':
+			# Forward-Forward: two forward passes, no backprop
+			self.ttt_fn = forward_forward_ttt(self._fwd_fn)
+		elif self.method == 'goodness':
+			# Goodness-based: simplified forward-forward without negatives
+			self.ttt_fn = goodness_ttt(self._fwd_fn)
+		elif self.method == 'perturbation':
+			# Activity perturbation: finite differences (SLOW)
+			self.ttt_fn = perturbation_ttt(self._fwd_fn)
+		elif self.method == 'spsa':
+			# Simultaneous perturbation: faster variant (still slow)
+			self.ttt_fn = simultaneous_perturbation_ttt(self._fwd_fn)
 		else:
 			raise ValueError(f"Unknown method: {self.method}")
 
